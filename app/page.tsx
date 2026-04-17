@@ -5,23 +5,13 @@ import { PointerEvent, useEffect, useRef, useState } from "react";
 
 type Verdict = "supported" | "hallucination" | "uncertain";
 
-type JudgeResult = {
-  judge: "fact-check" | "roast";
-  verdict: Verdict;
-  title: string;
-  summary: string;
-  detail?: string;
-  confidence?: number;
-};
-
 type AuditResponse = {
   text: string;
   cached: boolean;
   modelInfo: {
-    factCheck: string;
-    roast: string;
+    reviewers: Record<string, string>;
   };
-  results: JudgeResult[];
+  reviews: ModelReview[];
 };
 
 type SampleCase = {
@@ -36,6 +26,11 @@ type ModelReview = {
   avatarUrl: string;
   oneLiner: string;
   longComment: string;
+  modelId?: string;
+  usedModel?: string;
+  verdict?: Verdict;
+  confidence?: number;
+  styleSignature?: string;
 };
 
 const CARD_SPAN = 248;
@@ -53,11 +48,19 @@ const HERO_PROMPTS = [
 ];
 
 const LOADING_PROMPTS = [
-  "正在安抚 Opus 的情绪...",
-  "正在尝试不让 Gemini 先夸赞...",
-  "正在等 GPT 法官写完判词...",
-  "正在让 DeepSeek 收起毒舌...",
-  "正在统一法官团的最终口径...",
+  "正在接住GPT接不住的用户",
+  "正在拿走GPT最硬的那一刀",
+  "正在一句话锁死版本",
+  "正在讲一句可能会让你冷静一点的话",
+  "正在让Gemini停止夸赞",
+  "正在让Gemini停止给用户发奖",
+  "正在轻轻的推一下用户",
+  "正在很认真的说一句，不绕",
+  "正在给你拆清楚",
+  "正在给回复中加入emoji",
+  "正在掰开了，揉碎了，给你一版更狠的",
+  "正在给你一句底层判断（非常诚实）",
+  "正在把GPT放在这里接住你",
 ];
 
 const sampleCases: SampleCase[] = [
@@ -238,7 +241,7 @@ export default function Home() {
         payload = parsed;
       }
 
-      setReviews(buildModelReviews(cleaned, payload));
+      setReviews(payload.reviews);
     } catch (submitError) {
       setError(
         submitError instanceof Error ? submitError.message : "请求失败，请检查配置后重试。",
@@ -400,6 +403,7 @@ function LoadingScene() {
       <div className="w-full max-w-xl text-center">
         <RotatingEncryptedText
           texts={LOADING_PROMPTS}
+          randomize
           rotateEveryMs={1600}
           scrambleFrameMs={30}
           className="mx-auto text-[15px] uppercase tracking-[0.24em] text-black/45 md:text-[16px]"
@@ -474,10 +478,12 @@ function ResultScene({
                   </div>
                 </div>
 
-                <p className="mt-4 text-[22px] leading-[1.28] tracking-[-0.01em] text-black/80">
+                <p className="mt-4 text-[22px] leading-[1.28] tracking-[-0.01em] text-black/80 break-words [overflow-wrap:anywhere]">
                   {review.oneLiner}
                 </p>
-                <p className="mt-3 text-[13px] leading-6 text-black/62">{review.longComment}</p>
+                <p className="mt-3 text-[13px] leading-6 text-black/62 break-words [overflow-wrap:anywhere]">
+                  {review.longComment}
+                </p>
               </article>
             </div>
           ))}
@@ -520,11 +526,13 @@ function RotatingEncryptedText({
   className,
   rotateEveryMs = 3600,
   scrambleFrameMs = 42,
+  randomize = false,
 }: {
   texts: string[];
   className?: string;
   rotateEveryMs?: number;
   scrambleFrameMs?: number;
+  randomize?: boolean;
 }) {
   const [index, setIndex] = useState(0);
   const [display, setDisplay] = useState(texts[0] ?? "");
@@ -538,7 +546,17 @@ function RotatingEncryptedText({
     }
 
     rotateTimerRef.current = window.setInterval(() => {
-      setIndex((prev) => (prev + 1) % texts.length);
+      setIndex((prev) => {
+        if (!randomize) {
+          return (prev + 1) % texts.length;
+        }
+
+        let next = prev;
+        while (next === prev) {
+          next = Math.floor(Math.random() * texts.length);
+        }
+        return next;
+      });
     }, rotateEveryMs);
 
     return () => {
@@ -546,7 +564,7 @@ function RotatingEncryptedText({
         window.clearInterval(rotateTimerRef.current);
       }
     };
-  }, [texts, rotateEveryMs]);
+  }, [texts, rotateEveryMs, randomize]);
 
   useEffect(() => {
     const target = texts[index] ?? "";
@@ -618,83 +636,68 @@ function buildDemoAudit(text: string): AuditResponse {
   const suspects = ["只有", "百分之百", "一定", "全部", "从来不", "唯一"];
   const hasAbsoluteClaim = suspects.some((word) => text.includes(word));
 
-  const verdict: Verdict = hasAbsoluteClaim ? "uncertain" : "supported";
+  const verdict: Verdict = hasAbsoluteClaim ? "hallucination" : "supported";
+  const baseOneLiner = hasAbsoluteClaim
+    ? "语气很满，证据还没跟上。"
+    : "暂未发现明显硬伤。";
+  const baseLongComment = hasAbsoluteClaim
+    ? "这句包含绝对化表达，建议补充可复查来源后再下定论。"
+    : "结论目前可接受，但建议补一条来源让判断更稳。";
 
   return {
     text,
     cached: false,
     modelInfo: {
-      factCheck: "demo/fact-judge",
-      roast: "demo/roast-judge",
+      reviewers: {
+        opus: "demo/opus",
+        gpt: "demo/gpt",
+        gemini: "demo/gemini",
+        deepseek: "demo/deepseek",
+      },
     },
-    results: [
+    reviews: [
       {
-        judge: "fact-check",
+        id: "opus",
+        personaName: "不愿留下姓名的 Opus",
+        modelName: "Claude Opus",
+        avatarUrl: "https://cdn.jsdelivr.net/gh/homarr-labs/dashboard-icons/png/claude-ai-light.png",
         verdict,
-        title: "演示判定",
-        summary: hasAbsoluteClaim
-          ? "这句话含有绝对化表达，建议补充来源后再下结论。"
-          : "暂未发现明显硬伤，但建议继续核验出处。",
-        detail: "当前为演示模式结果，用于串联完整交互流程。",
-        confidence: hasAbsoluteClaim ? 0.62 : 0.71,
+        oneLiner: hasAbsoluteClaim ? "这句像宣言，不像证据。" : baseOneLiner,
+        longComment: baseLongComment,
+        usedModel: "demo/opus",
       },
       {
-        judge: "roast",
+        id: "gpt",
+        personaName: "只给结论的 GPT 法官",
+        modelName: "GPT",
+        avatarUrl: "https://cdn.jsdelivr.net/gh/homarr-labs/dashboard-icons/png/openai-light.png",
         verdict,
-        title: "演示锐评",
-        summary: hasAbsoluteClaim
-          ? "语气很满，证据还没跟上。"
-          : "这句还算稳，但别急着开香槟。",
-        confidence: hasAbsoluteClaim ? 0.68 : 0.74,
+        oneLiner: hasAbsoluteClaim ? "断言强度偏高。" : baseOneLiner,
+        longComment: baseLongComment,
+        usedModel: "demo/gpt",
+      },
+      {
+        id: "gemini",
+        personaName: "礼貌但不松口的 Gemini",
+        modelName: "Gemini",
+        avatarUrl: "https://cdn.jsdelivr.net/gh/homarr-labs/dashboard-icons/png/google-gemini.png",
+        verdict,
+        oneLiner: hasAbsoluteClaim ? "信息密度够了，证据密度不够。" : baseOneLiner,
+        longComment: baseLongComment,
+        usedModel: "demo/gemini",
+      },
+      {
+        id: "deepseek",
+        personaName: "嘴很硬的 DeepSeek",
+        modelName: "DeepSeek",
+        avatarUrl: "https://cdn.jsdelivr.net/gh/homarr-labs/dashboard-icons/png/deepseek.png",
+        verdict,
+        oneLiner: hasAbsoluteClaim ? "这波是常识翻车。" : baseOneLiner,
+        longComment: baseLongComment,
+        usedModel: "demo/deepseek",
       },
     ],
   };
-}
-
-function buildModelReviews(text: string, audit: AuditResponse): ModelReview[] {
-  const fact = audit.results.find((item) => item.judge === "fact-check");
-  const roast = audit.results.find((item) => item.judge === "roast");
-  const hasAbsoluteClaim = ["只有", "百分之百", "一定", "全部", "从来不", "唯一"].some(
-    (word) => text.includes(word),
-  );
-
-  return [
-    {
-      id: "opus",
-      personaName: "不愿留下姓名的 Opus",
-      modelName: "Claude Opus",
-      avatarUrl: "https://cdn.jsdelivr.net/gh/homarr-labs/dashboard-icons/png/claude-ai-light.png",
-      oneLiner: hasAbsoluteClaim ? "这句像宣言，不像证据。" : "这句可读，但证据位仍然空着。",
-      longComment: `${fact?.summary ?? "核心命题暂未发现明显矛盾。"} 我会建议把结论拆成可验证的两个子命题，并补一条可追溯来源。`,
-    },
-    {
-      id: "gpt",
-      personaName: "只给结论的 GPT 法官",
-      modelName: "GPT",
-      avatarUrl: "https://cdn.jsdelivr.net/gh/homarr-labs/dashboard-icons/png/openai-light.png",
-      oneLiner: hasAbsoluteClaim ? "断言强度偏高。" : "结论基本成立，但还不够严谨。",
-      longComment:
-        "从可验证性看，这句话需要补“谁说的、在哪说的、如何复查”三个信息位。补完这三项，可信度会明显提升。",
-    },
-    {
-      id: "gemini",
-      personaName: "礼貌但不松口的 Gemini",
-      modelName: "Gemini",
-      avatarUrl: "https://cdn.jsdelivr.net/gh/homarr-labs/dashboard-icons/png/google-gemini.png",
-      oneLiner: hasAbsoluteClaim ? "信息密度够了，证据密度不够。" : "表达顺畅，但证据锚点偏少。",
-      longComment:
-        "语义组织很清楚，不过目前更像“观点陈述”而不是“事实陈述”。如果补上出处，结论会更稳。",
-    },
-    {
-      id: "deepseek",
-      personaName: "嘴很硬的 DeepSeek",
-      modelName: "DeepSeek",
-      avatarUrl: "https://cdn.jsdelivr.net/gh/homarr-labs/dashboard-icons/png/deepseek.png",
-      oneLiner: roast?.summary ?? "这句有传播力，但还没到能盖章的程度。",
-      longComment:
-        "我会保留这句话的锋利度，但把绝对化词语降一级。先留出不确定空间，再补证据，会更像靠谱判断。",
-    },
-  ];
 }
 
 function buildShareText(submittedText: string, reviews: ModelReview[]) {
