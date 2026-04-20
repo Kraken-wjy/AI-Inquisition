@@ -4,14 +4,30 @@ import Image from "next/image";
 import { PointerEvent, useEffect, useRef, useState } from "react";
 
 type Verdict = "supported" | "hallucination" | "uncertain";
+type StyleMode = "guarded" | "free";
+type ShareStatus = "idle" | "shared" | "copied" | "failed";
+
+type CostControlMeta = {
+  aiNotice: string;
+  requestId: string;
+  inputChars: number;
+  maxInputChars: number;
+  rateLimitRemaining: number;
+  rateLimitResetSec: number;
+  cacheEntries: number;
+  cacheHitRate: number;
+  cacheTtlSec: number;
+};
 
 type AuditResponse = {
   text: string;
   cached: boolean;
   modelInfo: {
     reviewers: Record<string, string>;
+    styleMode: StyleMode;
   };
   reviews: ModelReview[];
+  meta?: CostControlMeta;
 };
 
 type SampleCase = {
@@ -38,6 +54,8 @@ const AUTO_SCROLL_SPEED = 0.33;
 const CARD_TILTS = [-1.2, 0.8, -0.6, 1.1, -1.4, 0.9, -0.7, 1.2];
 const REVIEW_CARD_TILTS = [-0.9, 0.7, -0.6, 0.95];
 const DEMO_LATENCY_MS = 1800;
+const CLIENT_MAX_INPUT_CHARS = Number(process.env.NEXT_PUBLIC_MAX_INPUT_CHARS ?? "240");
+const DEFAULT_AI_NOTICE = "AI 生成，仅供参考";
 
 const HERO_PROMPTS = [
   "想知道这段话有没有幻觉？",
@@ -101,10 +119,13 @@ const sampleCases: SampleCase[] = [
 export default function Home() {
   const [input, setInput] = useState("");
   const [demoMode, setDemoMode] = useState(false);
+  const [styleMode, setStyleMode] = useState<StyleMode>("guarded");
+  const [showDebugControls, setShowDebugControls] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [submittedText, setSubmittedText] = useState("");
   const [reviews, setReviews] = useState<ModelReview[] | null>(null);
+  const [meta, setMeta] = useState<CostControlMeta | null>(null);
 
   const viewportRef = useRef<HTMLDivElement | null>(null);
   const cardRefs = useRef<Array<HTMLButtonElement | null>>([]);
@@ -119,6 +140,15 @@ export default function Home() {
   const inputRef = useRef<HTMLInputElement | null>(null);
 
   const onHomeScene = !isLoading && !reviews;
+
+  useEffect(() => {
+    const envEnabled = process.env.NEXT_PUBLIC_SHOW_DEBUG_CONTROLS === "1";
+    const queryEnabled =
+      typeof window !== "undefined" &&
+      new URLSearchParams(window.location.search).get("debug") === "1";
+
+    setShowDebugControls(envEnabled || queryEnabled);
+  }, []);
 
   useEffect(() => {
     if (!onHomeScene) {
@@ -216,6 +246,7 @@ export default function Home() {
     setSubmittedText(cleaned);
     setError(null);
     setReviews(null);
+    setMeta(null);
     setIsLoading(true);
 
     try {
@@ -223,14 +254,14 @@ export default function Home() {
 
       if (demoMode) {
         await wait(DEMO_LATENCY_MS);
-        payload = buildDemoAudit(cleaned);
+        payload = buildDemoAudit(cleaned, styleMode);
       } else {
         const response = await fetch("/api/audit", {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
           },
-          body: JSON.stringify({ text: cleaned }),
+          body: JSON.stringify({ text: cleaned, styleMode }),
         });
 
         const parsed = (await response.json()) as AuditResponse & { error?: string };
@@ -242,6 +273,7 @@ export default function Home() {
       }
 
       setReviews(payload.reviews);
+      setMeta(payload.meta ?? null);
     } catch (submitError) {
       setError(
         submitError instanceof Error ? submitError.message : "请求失败，请检查配置后重试。",
@@ -272,9 +304,11 @@ export default function Home() {
         <ResultScene
           submittedText={submittedText}
           reviews={reviews}
+          meta={meta}
           onRetry={() => {
             setReviews(null);
             setError(null);
+            setMeta(null);
             inputRef.current?.focus();
           }}
         />
@@ -287,29 +321,59 @@ export default function Home() {
             />
 
             <div className="mt-5 w-full">
-              <div className="mb-2 flex items-center justify-end">
-                <label className="inline-flex cursor-pointer items-center gap-2 text-[11px] uppercase tracking-[0.16em] text-black/45">
-                  <span>演示模式</span>
-                  <button
-                    type="button"
-                    aria-pressed={demoMode}
-                    onClick={() => {
-                      setDemoMode((prev) => !prev);
-                    }}
-                    className={`relative h-5 w-10 rounded-full border transition ${
-                      demoMode
-                        ? "border-black/25 bg-black/80"
-                        : "border-black/15 bg-white/70"
-                    }`}
-                  >
-                    <span
-                      className={`absolute top-0.5 h-3.5 w-3.5 rounded-full transition ${
-                        demoMode ? "left-[21px] bg-white" : "left-0.5 bg-black/45"
+              {showDebugControls ? (
+                <div className="mb-2 flex flex-wrap items-center justify-end gap-3">
+                  <label className="inline-flex cursor-pointer items-center gap-2 text-[11px] uppercase tracking-[0.16em] text-black/45">
+                    <span>演示模式</span>
+                    <button
+                      type="button"
+                      aria-pressed={demoMode}
+                      onClick={() => {
+                        setDemoMode((prev) => !prev);
+                      }}
+                      className={`relative h-5 w-10 rounded-full border transition ${
+                        demoMode
+                          ? "border-black/25 bg-black/80"
+                          : "border-black/15 bg-white/70"
                       }`}
-                    />
-                  </button>
-                </label>
-              </div>
+                    >
+                      <span
+                        className={`absolute top-0.5 h-3.5 w-3.5 rounded-full transition ${
+                          demoMode ? "left-[21px] bg-white" : "left-0.5 bg-black/45"
+                        }`}
+                      />
+                    </button>
+                  </label>
+
+                  <div className="inline-flex items-center gap-2 text-[11px] uppercase tracking-[0.16em] text-black/45">
+                    <span>风格模式</span>
+                    <div className="inline-flex rounded-full border border-black/15 bg-white/70 p-0.5">
+                      <button
+                        type="button"
+                        onClick={() => setStyleMode("guarded")}
+                        className={`rounded-full px-2.5 py-1 text-[10px] transition ${
+                          styleMode === "guarded"
+                            ? "bg-black text-white"
+                            : "text-black/55 hover:text-black/75"
+                        }`}
+                      >
+                        不放开
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setStyleMode("free")}
+                        className={`rounded-full px-2.5 py-1 text-[10px] transition ${
+                          styleMode === "free"
+                            ? "bg-black text-white"
+                            : "text-black/55 hover:text-black/75"
+                        }`}
+                      >
+                        自由
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              ) : null}
 
               <form
                 onSubmit={(event) => {
@@ -322,7 +386,8 @@ export default function Home() {
                     ref={inputRef}
                     type="text"
                     value={input}
-                    onChange={(event) => setInput(event.target.value)}
+                    onChange={(event) => setInput(event.target.value.slice(0, CLIENT_MAX_INPUT_CHARS))}
+                    maxLength={CLIENT_MAX_INPUT_CHARS}
                     placeholder="粘贴一段 AI 文本..."
                     className="h-11 flex-1 bg-transparent text-base text-[#2a2a2a] outline-none placeholder:text-black/35"
                   />
@@ -333,6 +398,12 @@ export default function Home() {
                   >
                     开始判断
                   </button>
+                </div>
+                <div className="mt-2 flex items-center justify-between text-[11px] text-black/42">
+                  <p>{DEFAULT_AI_NOTICE}</p>
+                  <p>
+                    {input.length}/{CLIENT_MAX_INPUT_CHARS}
+                  </p>
                 </div>
               </form>
 
@@ -416,22 +487,39 @@ function LoadingScene() {
 function ResultScene({
   submittedText,
   reviews,
+  meta,
   onRetry,
 }: {
   submittedText: string;
   reviews: ModelReview[];
+  meta: CostControlMeta | null;
   onRetry: () => void;
 }) {
-  const [shareStatus, setShareStatus] = useState<"idle" | "copied" | "failed">("idle");
+  const [shareStatus, setShareStatus] = useState<ShareStatus>("idle");
 
   async function handleShare() {
     const shareText = buildShareText(submittedText, reviews);
+    const sharePayload = {
+      title: "AI 审判庭",
+      text: shareText,
+      url: typeof window !== "undefined" ? window.location.href : undefined,
+    };
 
     try {
-      await navigator.clipboard.writeText(shareText);
-      setShareStatus("copied");
+      if (typeof navigator !== "undefined" && "share" in navigator) {
+        await navigator.share(sharePayload);
+        setShareStatus("shared");
+      } else {
+        await navigator.clipboard.writeText(shareText);
+        setShareStatus("copied");
+      }
     } catch {
-      setShareStatus("failed");
+      try {
+        await navigator.clipboard.writeText(shareText);
+        setShareStatus("copied");
+      } catch {
+        setShareStatus("failed");
+      }
     }
 
     window.setTimeout(() => {
@@ -446,6 +534,9 @@ function ResultScene({
           <p className="text-[10px] uppercase tracking-[0.2em] text-black/45">AI 审判结果</p>
           <p className="mt-3 max-w-4xl text-[23px] leading-[1.35] tracking-[-0.02em] text-black/80">
             {submittedText}
+          </p>
+          <p className="mt-2 text-[11px] tracking-[0.08em] text-black/42">
+            {meta?.aiNotice ?? DEFAULT_AI_NOTICE}
           </p>
         </div>
 
@@ -510,12 +601,21 @@ function ResultScene({
             >
               {shareStatus === "copied"
                 ? "已复制"
+                : shareStatus === "shared"
+                  ? "已调起分享"
                 : shareStatus === "failed"
                   ? "复制失败"
                   : "分享结果"}
             </button>
           </div>
         </div>
+
+        {meta ? (
+          <p className="mt-4 text-center text-[11px] text-black/35">
+            缓存命中率 {Math.round(meta.cacheHitRate * 100)}% · 剩余请求 {meta.rateLimitRemaining} ·
+            窗口重置 {meta.rateLimitResetSec}s
+          </p>
+        ) : null}
       </div>
     </section>
   );
@@ -632,7 +732,7 @@ async function wait(ms: number) {
   });
 }
 
-function buildDemoAudit(text: string): AuditResponse {
+function buildDemoAudit(text: string, styleMode: StyleMode): AuditResponse {
   const suspects = ["只有", "百分之百", "一定", "全部", "从来不", "唯一"];
   const hasAbsoluteClaim = suspects.some((word) => text.includes(word));
 
@@ -648,6 +748,7 @@ function buildDemoAudit(text: string): AuditResponse {
     text,
     cached: false,
     modelInfo: {
+      styleMode,
       reviewers: {
         opus: "demo/opus",
         gpt: "demo/gpt",
@@ -655,12 +756,23 @@ function buildDemoAudit(text: string): AuditResponse {
         deepseek: "demo/deepseek",
       },
     },
+    meta: {
+      aiNotice: DEFAULT_AI_NOTICE,
+      requestId: "demo-mode",
+      inputChars: text.length,
+      maxInputChars: CLIENT_MAX_INPUT_CHARS,
+      rateLimitRemaining: 999,
+      rateLimitResetSec: 0,
+      cacheEntries: 0,
+      cacheHitRate: 0,
+      cacheTtlSec: 0,
+    },
     reviews: [
       {
         id: "opus",
         personaName: "不愿留下姓名的 Opus",
         modelName: "Claude Opus",
-        avatarUrl: "https://cdn.jsdelivr.net/gh/homarr-labs/dashboard-icons/png/claude-ai-light.png",
+        avatarUrl: "/avatars/opus.png",
         verdict,
         oneLiner: hasAbsoluteClaim ? "这句像宣言，不像证据。" : baseOneLiner,
         longComment: baseLongComment,
@@ -670,7 +782,7 @@ function buildDemoAudit(text: string): AuditResponse {
         id: "gpt",
         personaName: "只给结论的 GPT 法官",
         modelName: "GPT",
-        avatarUrl: "https://cdn.jsdelivr.net/gh/homarr-labs/dashboard-icons/png/openai-light.png",
+        avatarUrl: "/avatars/gpt.png",
         verdict,
         oneLiner: hasAbsoluteClaim ? "断言强度偏高。" : baseOneLiner,
         longComment: baseLongComment,
@@ -680,7 +792,7 @@ function buildDemoAudit(text: string): AuditResponse {
         id: "gemini",
         personaName: "礼貌但不松口的 Gemini",
         modelName: "Gemini",
-        avatarUrl: "https://cdn.jsdelivr.net/gh/homarr-labs/dashboard-icons/png/google-gemini.png",
+        avatarUrl: "/avatars/gemini.png",
         verdict,
         oneLiner: hasAbsoluteClaim ? "信息密度够了，证据密度不够。" : baseOneLiner,
         longComment: baseLongComment,
@@ -690,7 +802,7 @@ function buildDemoAudit(text: string): AuditResponse {
         id: "deepseek",
         personaName: "嘴很硬的 DeepSeek",
         modelName: "DeepSeek",
-        avatarUrl: "https://cdn.jsdelivr.net/gh/homarr-labs/dashboard-icons/png/deepseek.png",
+        avatarUrl: "/avatars/deepseek.png",
         verdict,
         oneLiner: hasAbsoluteClaim ? "这波是常识翻车。" : baseOneLiner,
         longComment: baseLongComment,
@@ -702,7 +814,7 @@ function buildDemoAudit(text: string): AuditResponse {
 
 function buildShareText(submittedText: string, reviews: ModelReview[]) {
   const lines = [
-    "AI 审判庭结果",
+    "AI 审判庭结果（AI 生成，仅供参考）",
     "",
     `待审文本：${submittedText}`,
     "",
