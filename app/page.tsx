@@ -49,13 +49,119 @@ type ModelReview = {
   styleSignature?: string;
 };
 
+type AuditErrorPayload = {
+  error?: string;
+};
+
 const CARD_SPAN = 248;
 const AUTO_SCROLL_SPEED = 0.33;
 const CARD_TILTS = [-1.2, 0.8, -0.6, 1.1, -1.4, 0.9, -0.7, 1.2];
 const REVIEW_CARD_TILTS = [-0.9, 0.7, -0.6, 0.95];
 const DEMO_LATENCY_MS = 1800;
+const API_REQUEST_TIMEOUT_MS = Number(process.env.NEXT_PUBLIC_AUDIT_TIMEOUT_MS ?? "18000");
+const API_REQUEST_RETRIES = Math.max(0, Number(process.env.NEXT_PUBLIC_AUDIT_RETRIES ?? "1"));
 const CLIENT_MAX_INPUT_CHARS = Number(process.env.NEXT_PUBLIC_MAX_INPUT_CHARS ?? "240");
 const DEFAULT_AI_NOTICE = "AI 生成，仅供参考";
+
+function isLikelyNetworkError(error: unknown) {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+
+  const normalized = error.message.toLowerCase();
+  return (
+    normalized.includes("failed to fetch") ||
+    normalized.includes("networkerror") ||
+    normalized.includes("load failed") ||
+    normalized.includes("timeout") ||
+    normalized.includes("aborted")
+  );
+}
+
+function mapAuditRequestError(error: unknown): string {
+  if (typeof navigator !== "undefined" && !navigator.onLine) {
+    return "当前网络离线，请先恢复网络连接后再试。";
+  }
+
+  if (!(error instanceof Error)) {
+    return "请求失败，请检查配置后重试。";
+  }
+
+  const normalized = error.message.toLowerCase();
+  if (normalized.includes("请求超时") || normalized.includes("timeout")) {
+    return "请求超时：服务响应较慢，请稍后重试。";
+  }
+  if (
+    normalized.includes("failed to fetch") ||
+    normalized.includes("networkerror") ||
+    normalized.includes("load failed")
+  ) {
+    return "无法连接到 /api/audit。请确认开发服务正在运行（npm run dev），并检查代理或浏览器插件是否拦截请求。";
+  }
+
+  return error.message || "请求失败，请检查配置后重试。";
+}
+
+async function requestAudit(text: string, styleMode: StyleMode): Promise<AuditResponse> {
+  const attempts = API_REQUEST_RETRIES + 1;
+  let lastError: unknown = null;
+
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    const controller = new AbortController();
+    const timeoutId = window.setTimeout(() => {
+      controller.abort();
+    }, API_REQUEST_TIMEOUT_MS);
+
+    try {
+      const response = await fetch("/api/audit", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ text, styleMode }),
+        signal: controller.signal,
+      });
+
+      const rawBody = await response.text();
+      let parsed: (AuditResponse & AuditErrorPayload) | null = null;
+      if (rawBody.trim()) {
+        try {
+          parsed = JSON.parse(rawBody) as AuditResponse & AuditErrorPayload;
+        } catch {
+          throw new Error(`接口返回了非 JSON 响应（HTTP ${response.status}）。`);
+        }
+      }
+
+      if (!response.ok) {
+        throw new Error(parsed?.error ?? `审判失败（HTTP ${response.status}），请稍后再试。`);
+      }
+
+      if (!parsed) {
+        throw new Error("接口返回为空，请稍后再试。");
+      }
+
+      return parsed;
+    } catch (error) {
+      if (error instanceof Error && error.name === "AbortError") {
+        lastError = new Error(`请求超时（>${Math.round(API_REQUEST_TIMEOUT_MS / 1000)}s）`);
+      } else {
+        lastError = error;
+      }
+
+      const shouldRetry = attempt < attempts - 1 && isLikelyNetworkError(lastError);
+      if (shouldRetry) {
+        await wait(400 * (attempt + 1));
+        continue;
+      }
+
+      throw lastError;
+    } finally {
+      window.clearTimeout(timeoutId);
+    }
+  }
+
+  throw (lastError instanceof Error ? lastError : new Error("请求失败，请稍后再试。"));
+}
 
 const HERO_PROMPTS = [
   "想知道这段话有没有幻觉？",
@@ -256,28 +362,13 @@ export default function Home() {
         await wait(DEMO_LATENCY_MS);
         payload = buildDemoAudit(cleaned, styleMode);
       } else {
-        const response = await fetch("/api/audit", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({ text: cleaned, styleMode }),
-        });
-
-        const parsed = (await response.json()) as AuditResponse & { error?: string };
-        if (!response.ok) {
-          throw new Error(parsed.error ?? "审判失败，请稍后再试。");
-        }
-
-        payload = parsed;
+        payload = await requestAudit(cleaned, styleMode);
       }
 
       setReviews(payload.reviews);
       setMeta(payload.meta ?? null);
     } catch (submitError) {
-      setError(
-        submitError instanceof Error ? submitError.message : "请求失败，请检查配置后重试。",
-      );
+      setError(mapAuditRequestError(submitError));
     } finally {
       setIsLoading(false);
     }
@@ -286,8 +377,6 @@ export default function Home() {
   const displayError =
     error && (error.includes("OPENROUTER_API_KEY") || error.includes("CRAZYROUTER_API_KEY"))
       ? "请先配置 API Key，再进行判断。"
-      : error?.toLowerCase().includes("failed to fetch")
-        ? "请求失败：网络连接或服务超时，请稍后重试。"
       : error;
 
   function selectCase(sample: SampleCase) {
