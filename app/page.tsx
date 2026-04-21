@@ -632,11 +632,11 @@ function ResultScene({
   }
 
   return (
-    <section className="mx-auto min-h-screen w-full max-w-[1500px] px-5 pb-8 pt-24 md:px-8 md:pt-26">
-      <div className="mx-auto max-w-6xl">
-        <div>
+    <section className="mx-auto h-[100svh] w-full max-w-[1500px] overflow-hidden px-5 pb-4 pt-20 md:px-8 md:pt-24">
+      <div className="mx-auto flex h-full max-w-6xl flex-col">
+        <div className="shrink-0">
           <p className="text-[10px] uppercase tracking-[0.2em] text-black/45">AI 审判结果</p>
-          <p className="mt-3 max-w-4xl text-[23px] leading-[1.35] tracking-[-0.02em] text-black/80">
+          <p className="mt-2 max-w-4xl line-clamp-2 text-[19px] leading-[1.35] tracking-[-0.02em] text-black/80 md:text-[22px]">
             {submittedText}
           </p>
           <p className="mt-2 text-[11px] tracking-[0.08em] text-black/42">
@@ -644,15 +644,15 @@ function ResultScene({
           </p>
         </div>
 
-        <div className="mt-[62px] grid grid-cols-2 gap-3 lg:grid-cols-4">
+        <div className="mt-5 grid min-h-0 flex-1 grid-cols-2 gap-3 lg:grid-cols-4">
           {reviews.map((review, index) => (
             <div
               key={review.id}
-              className="result-card-enter w-full max-w-[250px] justify-self-center"
+              className="result-card-enter h-full w-full max-w-[250px] justify-self-center"
               style={{ animationDelay: `${index * 520}ms` }}
             >
               <article
-                className="h-full min-h-[330px] rounded-md border border-black/10 bg-[#fafafa] p-4 shadow-[0_8px_20px_rgba(0,0,0,0.08)] md:min-h-[360px]"
+                className="flex h-full min-h-0 flex-col overflow-hidden rounded-md border border-black/10 bg-[#fafafa] p-3 shadow-[0_8px_20px_rgba(0,0,0,0.08)] md:p-4"
                 style={{ transform: `rotate(${REVIEW_CARD_TILTS[index % REVIEW_CARD_TILTS.length]}deg)` }}
               >
                 <div className="flex items-center gap-3">
@@ -673,10 +673,10 @@ function ResultScene({
                   </div>
                 </div>
 
-                <p className="mt-4 text-[22px] leading-[1.28] tracking-[-0.01em] text-black/80 break-words [overflow-wrap:anywhere]">
+                <p className="mt-3 line-clamp-3 text-[19px] leading-[1.28] tracking-[-0.01em] text-black/80 break-words [overflow-wrap:anywhere] md:text-[21px]">
                   {review.oneLiner}
                 </p>
-                <p className="mt-3 text-[13px] leading-6 text-black/62 break-words [overflow-wrap:anywhere]">
+                <p className="mt-2 line-clamp-6 text-[13px] leading-5 text-black/62 break-words [overflow-wrap:anywhere] md:line-clamp-7">
                   {review.longComment}
                 </p>
               </article>
@@ -713,13 +713,6 @@ function ResultScene({
             </button>
           </div>
         </div>
-
-        {meta ? (
-          <p className="mt-4 text-center text-[11px] text-black/35">
-            缓存命中率 {Math.round(meta.cacheHitRate * 100)}% · 剩余请求 {meta.rateLimitRemaining} ·
-            窗口重置 {meta.rateLimitResetSec}s
-          </p>
-        ) : null}
       </div>
     </section>
   );
