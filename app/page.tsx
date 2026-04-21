@@ -504,18 +504,31 @@ function ResultScene({
       text: shareText,
       url: typeof window !== "undefined" ? window.location.href : undefined,
     };
+    const nav =
+      typeof window !== "undefined"
+        ? (window.navigator as Navigator & {
+            share?: (data?: ShareData) => Promise<void>;
+            clipboard?: Clipboard;
+          })
+        : null;
 
     try {
-      if (typeof navigator !== "undefined" && "share" in navigator) {
-        await navigator.share(sharePayload);
+      if (nav?.share) {
+        await nav.share(sharePayload);
         setShareStatus("shared");
       } else {
-        await navigator.clipboard.writeText(shareText);
+        if (!nav?.clipboard) {
+          throw new Error("Clipboard API unavailable");
+        }
+        await nav.clipboard.writeText(shareText);
         setShareStatus("copied");
       }
     } catch {
       try {
-        await navigator.clipboard.writeText(shareText);
+        if (!nav?.clipboard) {
+          throw new Error("Clipboard API unavailable");
+        }
+        await nav.clipboard.writeText(shareText);
         setShareStatus("copied");
       } catch {
         setShareStatus("failed");
