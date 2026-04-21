@@ -286,6 +286,8 @@ export default function Home() {
   const displayError =
     error && (error.includes("OPENROUTER_API_KEY") || error.includes("CRAZYROUTER_API_KEY"))
       ? "请先配置 API Key，再进行判断。"
+      : error?.toLowerCase().includes("failed to fetch")
+        ? "请求失败：网络连接或服务超时，请稍后重试。"
       : error;
 
   function selectCase(sample: SampleCase) {

@@ -1,4 +1,6 @@
 import { NextResponse } from "next/server";
+export const runtime = "nodejs";
+export const maxDuration = 30;
 
 type Verdict = "supported" | "hallucination" | "uncertain";
 
@@ -131,8 +133,8 @@ const AI_NOTICE = "AI 生成，仅供参考";
 const MAX_INPUT_CHARS = getPositiveInt(process.env.MAX_INPUT_CHARS, 240);
 const RATE_LIMIT_WINDOW_MS = getPositiveInt(process.env.RATE_LIMIT_WINDOW_SECONDS, 600) * 1000;
 const RATE_LIMIT_MAX_REQUESTS = getPositiveInt(process.env.RATE_LIMIT_MAX_REQUESTS, 24);
-const REVIEW_TIMEOUT_MS = getPositiveInt(process.env.REVIEW_TIMEOUT_MS, 28000);
-const REVIEW_MAX_RETRIES = getNonNegativeInt(process.env.REVIEW_MAX_RETRIES, 1);
+const REVIEW_TIMEOUT_MS = getPositiveInt(process.env.REVIEW_TIMEOUT_MS, 6500);
+const REVIEW_MAX_RETRIES = getNonNegativeInt(process.env.REVIEW_MAX_RETRIES, 0);
 const CACHE_MAX_ENTRIES = getPositiveInt(process.env.CACHE_MAX_ENTRIES, 180);
 const REVIEW_MAX_TOKENS = getPositiveInt(process.env.REVIEW_MAX_TOKENS, 220);
 let cacheHits = 0;
@@ -624,6 +626,10 @@ async function requestJudgeWithFallback({
           error instanceof Error ? error.message : `模型 ${model} 调用失败（未知错误）`;
         const attemptLabel = `模型 ${model} 第 ${attempt + 1}/${REVIEW_MAX_RETRIES + 1} 次失败：${message}`;
         failures.push(attemptLabel);
+        // 超时通常意味着通道拥堵，继续回退会明显拉长整次请求，先快速结束该卡片。
+        if (message.includes("请求超时")) {
+          break;
+        }
       }
     }
   }
