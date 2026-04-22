@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 export const runtime = "nodejs";
-export const maxDuration = 30;
+export const maxDuration = 90;
 
 type Verdict = "supported" | "hallucination" | "uncertain";
 

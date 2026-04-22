@@ -58,8 +58,8 @@ const AUTO_SCROLL_SPEED = 0.33;
 const CARD_TILTS = [-1.2, 0.8, -0.6, 1.1, -1.4, 0.9, -0.7, 1.2];
 const REVIEW_CARD_TILTS = [-0.9, 0.7, -0.6, 0.95];
 const DEMO_LATENCY_MS = 1800;
-const API_REQUEST_TIMEOUT_MS = Number(process.env.NEXT_PUBLIC_AUDIT_TIMEOUT_MS ?? "18000");
-const API_REQUEST_RETRIES = Math.max(0, Number(process.env.NEXT_PUBLIC_AUDIT_RETRIES ?? "1"));
+const API_REQUEST_TIMEOUT_MS = Number(process.env.NEXT_PUBLIC_AUDIT_TIMEOUT_MS ?? "65000");
+const API_REQUEST_RETRIES = Math.max(0, Number(process.env.NEXT_PUBLIC_AUDIT_RETRIES ?? "0"));
 const CLIENT_MAX_INPUT_CHARS = Number(process.env.NEXT_PUBLIC_MAX_INPUT_CHARS ?? "240");
 const DEFAULT_AI_NOTICE = "AI 生成，仅供参考";
 
