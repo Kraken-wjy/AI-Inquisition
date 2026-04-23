@@ -53,6 +53,11 @@ type AuditErrorPayload = {
   error?: string;
 };
 
+type AuditRequestOptions = {
+  retryCardIds?: string[];
+  forceRefresh?: boolean;
+};
+
 const CARD_SPAN = 248;
 const AUTO_SCROLL_SPEED = 0.33;
 const CARD_TILTS = [-1.2, 0.8, -0.6, 1.1, -1.4, 0.9, -0.7, 1.2];
@@ -102,7 +107,19 @@ function mapAuditRequestError(error: unknown): string {
   return error.message || "请求失败，请检查配置后重试。";
 }
 
-async function requestAudit(text: string, styleMode: StyleMode): Promise<AuditResponse> {
+function isOfflineReview(review: ModelReview) {
+  return (
+    review.verdict === "uncertain" &&
+    review.oneLiner.includes("暂时离线") &&
+    review.longComment.includes("当前通道繁忙")
+  );
+}
+
+async function requestAudit(
+  text: string,
+  styleMode: StyleMode,
+  options?: AuditRequestOptions,
+): Promise<AuditResponse> {
   const attempts = API_REQUEST_RETRIES + 1;
   let lastError: unknown = null;
 
@@ -118,7 +135,14 @@ async function requestAudit(text: string, styleMode: StyleMode): Promise<AuditRe
         headers: {
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({ text, styleMode }),
+        body: JSON.stringify({
+          text,
+          styleMode,
+          ...(options?.retryCardIds && options.retryCardIds.length > 0
+            ? { retryCardIds: options.retryCardIds }
+            : {}),
+          ...(options?.forceRefresh ? { forceRefresh: true } : {}),
+        }),
         signal: controller.signal,
       });
 
@@ -228,6 +252,7 @@ export default function Home() {
   const [styleMode, setStyleMode] = useState<StyleMode>("guarded");
   const [showDebugControls, setShowDebugControls] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
+  const [isRetryingFailed, setIsRetryingFailed] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [submittedText, setSubmittedText] = useState("");
   const [reviews, setReviews] = useState<ModelReview[] | null>(null);
@@ -374,6 +399,32 @@ export default function Home() {
     }
   }
 
+  async function retryFailedCards() {
+    if (!reviews || isLoading || isRetryingFailed) {
+      return;
+    }
+
+    const failedIds = reviews.filter(isOfflineReview).map((review) => review.id);
+    if (failedIds.length === 0) {
+      return;
+    }
+
+    setError(null);
+    setIsRetryingFailed(true);
+    try {
+      const payload = await requestAudit(submittedText, styleMode, {
+        retryCardIds: failedIds,
+        forceRefresh: true,
+      });
+      setReviews(payload.reviews);
+      setMeta(payload.meta ?? null);
+    } catch (retryError) {
+      setError(mapAuditRequestError(retryError));
+    } finally {
+      setIsRetryingFailed(false);
+    }
+  }
+
   const displayError =
     error && (error.includes("OPENROUTER_API_KEY") || error.includes("CRAZYROUTER_API_KEY"))
       ? "请先配置 API Key，再进行判断。"
@@ -396,11 +447,16 @@ export default function Home() {
           submittedText={submittedText}
           reviews={reviews}
           meta={meta}
+          failedCount={reviews.filter(isOfflineReview).length}
+          retryingFailed={isRetryingFailed}
           onRetry={() => {
             setReviews(null);
             setError(null);
             setMeta(null);
             inputRef.current?.focus();
+          }}
+          onRetryFailed={() => {
+            void retryFailedCards();
           }}
         />
       ) : (
@@ -579,12 +635,18 @@ function ResultScene({
   submittedText,
   reviews,
   meta,
+  failedCount,
+  retryingFailed,
   onRetry,
+  onRetryFailed,
 }: {
   submittedText: string;
   reviews: ModelReview[];
   meta: CostControlMeta | null;
+  failedCount: number;
+  retryingFailed: boolean;
   onRetry: () => void;
+  onRetryFailed: () => void;
 }) {
   const [shareStatus, setShareStatus] = useState<ShareStatus>("idle");
   const resultRef = useRef<HTMLDivElement | null>(null);
@@ -715,6 +777,16 @@ function ResultScene({
             >
               再审一句
             </button>
+            {failedCount > 0 ? (
+              <button
+                type="button"
+                onClick={onRetryFailed}
+                disabled={retryingFailed}
+                className="rounded-lg border border-black/15 bg-white/70 px-4 py-2 text-xs uppercase tracking-[0.14em] text-black/65 transition hover:border-black/30 disabled:cursor-not-allowed disabled:opacity-55"
+              >
+                {retryingFailed ? "重试中…" : `重试挂掉卡片（${failedCount}）`}
+              </button>
+            ) : null}
             <button
               type="button"
               onClick={() => {

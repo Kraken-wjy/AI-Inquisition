@@ -33,6 +33,8 @@ type ReviewCardResult = {
 type AuditPayload = {
   text?: string;
   styleMode?: StyleMode;
+  retryCardIds?: string[];
+  forceRefresh?: boolean;
 };
 
 type ProviderResult = {
@@ -314,6 +316,16 @@ export async function POST(request: Request) {
 
   const text = payload.text?.trim();
   const styleMode = resolveStyleMode(payload.styleMode);
+  const knownReviewIds = new Set(REVIEW_MODEL_CONFIGS.map((item) => item.id));
+  const retryCardIds = Array.from(
+    new Set(
+      (payload.retryCardIds ?? [])
+        .map((item) => item.trim())
+        .filter((item) => knownReviewIds.has(item)),
+    ),
+  );
+  const retryMode = retryCardIds.length > 0;
+  const forceRefresh = payload.forceRefresh === true || retryMode;
 
   if (!text) {
     return NextResponse.json(
@@ -364,7 +376,7 @@ export async function POST(request: Request) {
   const cached = auditCache.get(cacheKey);
   const isFresh = cached && Date.now() - cached.createdAt < CACHE_TTL_MS;
 
-  if (isFresh) {
+  if (isFresh && !forceRefresh) {
     cacheHits += 1;
     return NextResponse.json({
       text,
@@ -379,7 +391,9 @@ export async function POST(request: Request) {
       }),
     });
   }
-  cacheMisses += 1;
+  if (!isFresh) {
+    cacheMisses += 1;
+  }
 
   const apiKey = process.env.CRAZYROUTER_API_KEY ?? process.env.OPENROUTER_API_KEY;
   const apiBaseUrl = (
@@ -407,8 +421,13 @@ export async function POST(request: Request) {
 
   try {
     const supportedModels = await getSupportedModelIds(apiKey, apiBaseUrl);
-    const reviewOutcomes = await mapWithConcurrency(
-      REVIEW_MODEL_CONFIGS,
+    const retrySet = new Set(retryCardIds);
+    const targetConfigs = retryMode
+      ? REVIEW_MODEL_CONFIGS.filter((reviewConfig) => retrySet.has(reviewConfig.id))
+      : REVIEW_MODEL_CONFIGS;
+
+    const partialOutcomes = await mapWithConcurrency(
+      targetConfigs,
       REVIEW_CONCURRENCY,
       (reviewConfig) =>
         buildReviewCard({
@@ -420,6 +439,12 @@ export async function POST(request: Request) {
           candidateModels: resolveCandidateModels(reviewConfig, supportedModels),
         }),
     );
+    const reviewOutcomes = retryMode
+      ? mergeReviewOutcomes({
+          baseReviews: isFresh && cached ? cached.reviews : [],
+          retryOutcomes: partialOutcomes,
+        })
+      : partialOutcomes;
 
     const reviewers = reviewOutcomes.reduce<Record<string, string>>((acc, item) => {
       acc[item.id] = item.usedModel;
@@ -521,13 +546,7 @@ async function buildReviewCard({
       styleSignature: outcome.result.styleSignature,
     };
   } catch {
-    return {
-      ...reviewConfig,
-      usedModel: candidateModels[0] ?? reviewConfig.modelId,
-      verdict: "uncertain",
-      oneLiner: "该模型暂时离线，未能返回判词。",
-      longComment: "当前通道繁忙，请稍后再试，或先参考其他模型结论。",
-    };
+    return buildUnavailableReviewCard(reviewConfig, candidateModels[0]);
   }
 }
 
@@ -990,6 +1009,34 @@ function applyPersonaFlavor(cardId: string, oneLiner: string, longComment: strin
     oneLiner: normalizeTextForCard(`${phrase}${oneLiner}`, oneLiner, 32),
     longComment,
   };
+}
+
+function buildUnavailableReviewCard(reviewConfig: ReviewModelConfig, usedModel?: string): ReviewCardResult {
+  return {
+    ...reviewConfig,
+    usedModel: usedModel ?? reviewConfig.modelId,
+    verdict: "uncertain",
+    oneLiner: "该模型暂时离线，未能返回判词。",
+    longComment: "当前通道繁忙，请稍后再试，或先参考其他模型结论。",
+  };
+}
+
+function mergeReviewOutcomes({
+  baseReviews,
+  retryOutcomes,
+}: {
+  baseReviews: ReviewCardResult[];
+  retryOutcomes: ReviewCardResult[];
+}) {
+  const merged = new Map<string, ReviewCardResult>();
+  for (const review of baseReviews) {
+    merged.set(review.id, review);
+  }
+  for (const review of retryOutcomes) {
+    merged.set(review.id, review);
+  }
+
+  return REVIEW_MODEL_CONFIGS.map((config) => merged.get(config.id) ?? buildUnavailableReviewCard(config));
 }
 
 async function getSupportedModelIds(apiKey: string, apiBaseUrl: string) {
