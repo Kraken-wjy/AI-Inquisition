@@ -67,6 +67,22 @@ type OpenRouterResponse = {
   choices?: OpenRouterChoice[];
 };
 
+type ProviderErrorPayload = {
+  code?: string;
+  message?: string;
+};
+
+type ProviderErrorResponse = {
+  code?: string;
+  message?: string;
+  error?: ProviderErrorPayload | string;
+};
+
+type ModelsResponse = {
+  data?: Array<{ id?: string }>;
+  models?: Array<{ id?: string }>;
+};
+
 type ModelInfo = {
   reviewers: Record<string, string>;
   styleMode: StyleMode;
@@ -125,8 +141,23 @@ type ReviewModelConfig = {
 
 type StyleMode = "guarded" | "free";
 
+class JudgeRequestError extends Error {
+  status?: number;
+  code?: string;
+  retryable: boolean;
+
+  constructor(message: string, options?: { status?: number; code?: string; retryable?: boolean }) {
+    super(message);
+    this.name = "JudgeRequestError";
+    this.status = options?.status;
+    this.code = options?.code;
+    this.retryable = options?.retryable ?? false;
+  }
+}
+
 const auditCache = new Map<string, CacheRecord>();
 const rateLimitStore = new Map<string, RateLimitRecord>();
+const modelsCache = new Map<string, { expiresAt: number; modelIds: Set<string> }>();
 const CACHE_TTL_MS = 1000 * 60 * 10;
 const DEFAULT_API_BASE_URL = "https://crazyrouter.com/v1";
 const AI_NOTICE = "AI 生成，仅供参考";
@@ -135,6 +166,11 @@ const RATE_LIMIT_WINDOW_MS = getPositiveInt(process.env.RATE_LIMIT_WINDOW_SECOND
 const RATE_LIMIT_MAX_REQUESTS = getPositiveInt(process.env.RATE_LIMIT_MAX_REQUESTS, 24);
 const REVIEW_TIMEOUT_MS = getPositiveInt(process.env.REVIEW_TIMEOUT_MS, 15000);
 const REVIEW_MAX_RETRIES = getNonNegativeInt(process.env.REVIEW_MAX_RETRIES, 0);
+const REVIEW_RETRYABLE_MAX_RETRIES = getNonNegativeInt(process.env.REVIEW_RETRYABLE_MAX_RETRIES, 2);
+const REVIEW_RETRY_BASE_DELAY_MS = getPositiveInt(process.env.REVIEW_RETRY_BASE_DELAY_MS, 800);
+const REVIEW_CONCURRENCY = getPositiveInt(process.env.REVIEW_CONCURRENCY, 2);
+const MODELS_CACHE_TTL_MS = getPositiveInt(process.env.MODELS_CACHE_TTL_SECONDS, 300) * 1000;
+const MODELS_FETCH_TIMEOUT_MS = getPositiveInt(process.env.MODELS_FETCH_TIMEOUT_MS, 4500);
 const CACHE_MAX_ENTRIES = getPositiveInt(process.env.CACHE_MAX_ENTRIES, 180);
 const REVIEW_MAX_TOKENS = getPositiveInt(process.env.REVIEW_MAX_TOKENS, 220);
 let cacheHits = 0;
@@ -369,16 +405,19 @@ export async function POST(request: Request) {
   }
 
   try {
-    const reviewOutcomes = await Promise.all(
-      REVIEW_MODEL_CONFIGS.map((reviewConfig) =>
+    const supportedModels = await getSupportedModelIds(apiKey, apiBaseUrl);
+    const reviewOutcomes = await mapWithConcurrency(
+      REVIEW_MODEL_CONFIGS,
+      REVIEW_CONCURRENCY,
+      (reviewConfig) =>
         buildReviewCard({
           apiKey,
           apiBaseUrl,
           text,
           styleMode,
           reviewConfig,
+          candidateModels: resolveCandidateModels(reviewConfig, supportedModels),
         }),
-      ),
     );
 
     const reviewers = reviewOutcomes.reduce<Record<string, string>>((acc, item) => {
@@ -429,18 +468,24 @@ async function buildReviewCard({
   text,
   styleMode,
   reviewConfig,
+  candidateModels,
 }: {
   apiKey: string;
   apiBaseUrl: string;
   text: string;
   styleMode: StyleMode;
   reviewConfig: ReviewModelConfig;
+  candidateModels: string[];
 }): Promise<ReviewCardResult> {
   try {
+    if (candidateModels.length === 0) {
+      throw new Error("当前 token 未开放该卡片候选模型。");
+    }
+
     const outcome = await requestJudgeWithFallback({
       apiKey,
       apiBaseUrl,
-      models: [reviewConfig.modelId, ...(reviewConfig.fallbackModelIds ?? [])],
+      models: candidateModels,
       judge: "roast",
       input: text,
       maxTokens: REVIEW_MAX_TOKENS,
@@ -477,7 +522,7 @@ async function buildReviewCard({
   } catch {
     return {
       ...reviewConfig,
-      usedModel: reviewConfig.modelId,
+      usedModel: candidateModels[0] ?? reviewConfig.modelId,
       verdict: "uncertain",
       oneLiner: "该模型暂时离线，未能返回判词。",
       longComment: "当前通道繁忙，请稍后再试，或先参考其他模型结论。",
@@ -549,16 +594,29 @@ async function requestJudge({
     });
   } catch (error) {
     if (error instanceof Error && error.name === "AbortError") {
-      throw new Error(`模型 ${model} 请求超时（>${Math.round(REVIEW_TIMEOUT_MS / 1000)}s）。`);
+      throw new JudgeRequestError(`模型 ${model} 请求超时（>${Math.round(REVIEW_TIMEOUT_MS / 1000)}s）。`, {
+        status: 408,
+        retryable: false,
+      });
     }
-    throw error;
+    throw new JudgeRequestError(error instanceof Error ? error.message : `模型 ${model} 网络调用失败。`, {
+      retryable: true,
+    });
   } finally {
     clearTimeout(timeoutHandle);
   }
 
   if (!response.ok) {
     const errorText = await response.text();
-    throw new Error(`模型 ${model} 调用失败：${errorText}`);
+    const parsed = parseProviderError(errorText);
+    throw new JudgeRequestError(
+      `模型 ${model} 调用失败（HTTP ${response.status}${parsed.code ? `/${parsed.code}` : ""}）：${parsed.message}`,
+      {
+        status: response.status,
+        code: parsed.code,
+        retryable: isRetriableStatus(response.status),
+      },
+    );
   }
 
   const payload = (await response.json()) as OpenRouterResponse;
@@ -605,7 +663,8 @@ async function requestJudgeWithFallback({
       continue;
     }
 
-    for (let attempt = 0; attempt <= REVIEW_MAX_RETRIES; attempt += 1) {
+    let attempt = 0;
+    while (true) {
       try {
         const result = await requestJudge({
           apiKey,
@@ -624,12 +683,22 @@ async function requestJudgeWithFallback({
       } catch (error) {
         const message =
           error instanceof Error ? error.message : `模型 ${model} 调用失败（未知错误）`;
-        const attemptLabel = `模型 ${model} 第 ${attempt + 1}/${REVIEW_MAX_RETRIES + 1} 次失败：${message}`;
+        const attemptLabel = `模型 ${model} 第 ${attempt + 1} 次失败：${message}`;
         failures.push(attemptLabel);
         // 超时通常意味着通道拥堵，继续回退会明显拉长整次请求，先快速结束该卡片。
         if (message.includes("请求超时")) {
           break;
         }
+
+        const maxRetries = shouldRetryModelRequest(error)
+          ? REVIEW_RETRYABLE_MAX_RETRIES
+          : REVIEW_MAX_RETRIES;
+        if (attempt >= maxRetries) {
+          break;
+        }
+
+        attempt += 1;
+        await sleep(getRetryDelayMs(attempt));
       }
     }
   }
@@ -925,6 +994,149 @@ function applyPersonaFlavor(cardId: string, oneLiner: string, longComment: strin
     oneLiner: normalizeTextForCard(`${phrase}${oneLiner}`, oneLiner, 32),
     longComment,
   };
+}
+
+async function getSupportedModelIds(apiKey: string, apiBaseUrl: string) {
+  const cacheKey = `${apiBaseUrl}::${apiKey.slice(-8)}`;
+  const now = Date.now();
+  const cached = modelsCache.get(cacheKey);
+  if (cached && cached.expiresAt > now) {
+    return cached.modelIds;
+  }
+
+  const timeoutController = new AbortController();
+  const timeoutHandle = setTimeout(() => {
+    timeoutController.abort();
+  }, MODELS_FETCH_TIMEOUT_MS);
+
+  try {
+    const response = await fetch(`${apiBaseUrl}/models`, {
+      method: "GET",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      signal: timeoutController.signal,
+    });
+    if (!response.ok) {
+      return null;
+    }
+
+    const payload = (await response.json()) as ModelsResponse;
+    const bucket = Array.isArray(payload.data) ? payload.data : Array.isArray(payload.models) ? payload.models : [];
+    const modelIds = new Set(
+      bucket
+        .map((item) => item.id?.trim())
+        .filter((item): item is string => Boolean(item)),
+    );
+    if (modelIds.size === 0) {
+      return null;
+    }
+
+    modelsCache.set(cacheKey, {
+      expiresAt: now + MODELS_CACHE_TTL_MS,
+      modelIds,
+    });
+    return modelIds;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timeoutHandle);
+  }
+}
+
+function resolveCandidateModels(reviewConfig: ReviewModelConfig, supportedModels: Set<string> | null) {
+  const candidates = [reviewConfig.modelId, ...(reviewConfig.fallbackModelIds ?? [])]
+    .map((item) => item.trim())
+    .filter(Boolean);
+  if (!supportedModels || supportedModels.size === 0) {
+    return candidates;
+  }
+  return candidates.filter((item) => supportedModels.has(item));
+}
+
+function parseProviderError(raw: string) {
+  try {
+    const parsed = JSON.parse(raw) as ProviderErrorResponse;
+    const directCode = typeof parsed.code === "string" ? parsed.code : undefined;
+    const directMessage = typeof parsed.message === "string" ? parsed.message : undefined;
+    if (typeof parsed.error === "string") {
+      return {
+        code: directCode,
+        message: parsed.error.slice(0, 180),
+      };
+    }
+
+    const nestedCode = typeof parsed.error?.code === "string" ? parsed.error.code : undefined;
+    const nestedMessage = typeof parsed.error?.message === "string" ? parsed.error.message : undefined;
+    return {
+      code: nestedCode ?? directCode,
+      message: (nestedMessage ?? directMessage ?? raw).slice(0, 180),
+    };
+  } catch {
+    return {
+      code: undefined,
+      message: raw.slice(0, 180),
+    };
+  }
+}
+
+function isRetriableStatus(status: number) {
+  return [429, 500, 502, 503, 504].includes(status);
+}
+
+function shouldRetryModelRequest(error: unknown) {
+  if (error instanceof JudgeRequestError) {
+    return error.retryable;
+  }
+  if (!(error instanceof Error)) {
+    return false;
+  }
+
+  const lower = error.message.toLowerCase();
+  return (
+    lower.includes("failed to fetch") ||
+    lower.includes("network error") ||
+    lower.includes("service temporarily unavailable")
+  );
+}
+
+function getRetryDelayMs(attempt: number) {
+  return Math.min(6000, REVIEW_RETRY_BASE_DELAY_MS * 2 ** Math.max(0, attempt - 1));
+}
+
+async function sleep(ms: number) {
+  await new Promise<void>((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  concurrency: number,
+  worker: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  if (items.length === 0) {
+    return [];
+  }
+
+  const cap = Math.min(Math.max(1, concurrency), items.length);
+  const output = new Array<R>(items.length);
+  let cursor = 0;
+
+  const runner = async () => {
+    while (true) {
+      const index = cursor;
+      if (index >= items.length) {
+        return;
+      }
+      cursor += 1;
+      output[index] = await worker(items[index], index);
+    }
+  };
+
+  await Promise.all(Array.from({ length: cap }, () => runner()));
+  return output;
 }
 
 function getClientKey(request: Request) {
