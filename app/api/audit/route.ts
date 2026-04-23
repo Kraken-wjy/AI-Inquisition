@@ -164,11 +164,12 @@ const AI_NOTICE = "AI 生成，仅供参考";
 const MAX_INPUT_CHARS = getPositiveInt(process.env.MAX_INPUT_CHARS, 240);
 const RATE_LIMIT_WINDOW_MS = getPositiveInt(process.env.RATE_LIMIT_WINDOW_SECONDS, 600) * 1000;
 const RATE_LIMIT_MAX_REQUESTS = getPositiveInt(process.env.RATE_LIMIT_MAX_REQUESTS, 24);
-const REVIEW_TIMEOUT_MS = getPositiveInt(process.env.REVIEW_TIMEOUT_MS, 15000);
+const REVIEW_TIMEOUT_MS = getPositiveInt(process.env.REVIEW_TIMEOUT_MS, 30000);
 const REVIEW_MAX_RETRIES = getNonNegativeInt(process.env.REVIEW_MAX_RETRIES, 0);
 const REVIEW_RETRYABLE_MAX_RETRIES = getNonNegativeInt(process.env.REVIEW_RETRYABLE_MAX_RETRIES, 2);
 const REVIEW_RETRY_BASE_DELAY_MS = getPositiveInt(process.env.REVIEW_RETRY_BASE_DELAY_MS, 800);
 const REVIEW_CONCURRENCY = getPositiveInt(process.env.REVIEW_CONCURRENCY, 2);
+const REVIEW_GLOBAL_FALLBACK_MODELS = parseModelList(process.env.REVIEW_GLOBAL_FALLBACK_MODELS, []);
 const MODELS_CACHE_TTL_MS = getPositiveInt(process.env.MODELS_CACHE_TTL_SECONDS, 300) * 1000;
 const MODELS_FETCH_TIMEOUT_MS = getPositiveInt(process.env.MODELS_FETCH_TIMEOUT_MS, 4500);
 const CACHE_MAX_ENTRIES = getPositiveInt(process.env.CACHE_MAX_ENTRIES, 180);
@@ -685,11 +686,6 @@ async function requestJudgeWithFallback({
           error instanceof Error ? error.message : `模型 ${model} 调用失败（未知错误）`;
         const attemptLabel = `模型 ${model} 第 ${attempt + 1} 次失败：${message}`;
         failures.push(attemptLabel);
-        // 超时通常意味着通道拥堵，继续回退会明显拉长整次请求，先快速结束该卡片。
-        if (message.includes("请求超时")) {
-          break;
-        }
-
         const maxRetries = shouldRetryModelRequest(error)
           ? REVIEW_RETRYABLE_MAX_RETRIES
           : REVIEW_MAX_RETRIES;
@@ -1046,13 +1042,18 @@ async function getSupportedModelIds(apiKey: string, apiBaseUrl: string) {
 }
 
 function resolveCandidateModels(reviewConfig: ReviewModelConfig, supportedModels: Set<string> | null) {
-  const candidates = [reviewConfig.modelId, ...(reviewConfig.fallbackModelIds ?? [])]
+  const candidates = [
+    reviewConfig.modelId,
+    ...(reviewConfig.fallbackModelIds ?? []),
+    ...REVIEW_GLOBAL_FALLBACK_MODELS,
+  ]
     .map((item) => item.trim())
     .filter(Boolean);
+  const deduped = Array.from(new Set(candidates));
   if (!supportedModels || supportedModels.size === 0) {
-    return candidates;
+    return deduped;
   }
-  return candidates.filter((item) => supportedModels.has(item));
+  return deduped.filter((item) => supportedModels.has(item));
 }
 
 function parseProviderError(raw: string) {
