@@ -587,43 +587,62 @@ function ResultScene({
   onRetry: () => void;
 }) {
   const [shareStatus, setShareStatus] = useState<ShareStatus>("idle");
+  const resultRef = useRef<HTMLDivElement | null>(null);
 
   async function handleShare() {
     const shareText = buildShareText(submittedText, reviews);
-    const sharePayload = {
-      title: "AI 审判庭",
-      text: shareText,
-      url: typeof window !== "undefined" ? window.location.href : undefined,
-    };
     const nav =
       typeof window !== "undefined"
         ? (window.navigator as Navigator & {
             share?: (data?: ShareData) => Promise<void>;
+            canShare?: (data?: ShareData) => boolean;
             clipboard?: Clipboard;
           })
         : null;
 
     try {
+      const imageBlob = resultRef.current ? await captureResultImage(resultRef.current) : null;
+      if (imageBlob) {
+        const imageFile = new File([imageBlob], `ai-inquisition-${Date.now()}.png`, { type: "image/png" });
+        if (nav?.share && nav.canShare?.({ files: [imageFile] })) {
+          await nav.share({
+            title: "AI 审判庭结果",
+            text: "AI 生成，仅供参考",
+            files: [imageFile],
+          });
+          setShareStatus("shared");
+          return;
+        }
+
+        if (
+          nav?.clipboard &&
+          typeof nav.clipboard.write === "function" &&
+          typeof window !== "undefined" &&
+          "ClipboardItem" in window
+        ) {
+          await nav.clipboard.write([new ClipboardItem({ "image/png": imageBlob })]);
+          setShareStatus("copied");
+          return;
+        }
+      }
+
       if (nav?.share) {
-        await nav.share(sharePayload);
+        await nav.share({
+          title: "AI 审判庭",
+          text: shareText,
+          url: typeof window !== "undefined" ? window.location.href : undefined,
+        });
         setShareStatus("shared");
-      } else {
-        if (!nav?.clipboard) {
-          throw new Error("Clipboard API unavailable");
-        }
-        await nav.clipboard.writeText(shareText);
-        setShareStatus("copied");
+        return;
       }
+
+      if (!nav?.clipboard) {
+        throw new Error("Clipboard API unavailable");
+      }
+      await nav.clipboard.writeText(shareText);
+      setShareStatus("copied");
     } catch {
-      try {
-        if (!nav?.clipboard) {
-          throw new Error("Clipboard API unavailable");
-        }
-        await nav.clipboard.writeText(shareText);
-        setShareStatus("copied");
-      } catch {
-        setShareStatus("failed");
-      }
+      setShareStatus("failed");
     }
 
     window.setTimeout(() => {
@@ -633,7 +652,7 @@ function ResultScene({
 
   return (
     <section className="mx-auto h-[100svh] w-full max-w-[1500px] overflow-hidden px-5 pb-3 pt-18 md:px-8 md:pt-22">
-      <div className="mx-auto flex h-full max-w-6xl flex-col">
+      <div ref={resultRef} className="mx-auto flex h-full max-w-6xl flex-col">
         <div className="shrink-0">
           <p className="text-[10px] uppercase tracking-[0.2em] text-black/45">AI 审判结果</p>
           <p className="mt-2 max-w-4xl line-clamp-2 text-[19px] leading-[1.35] tracking-[-0.02em] text-black/80 md:text-[22px]">
@@ -812,6 +831,24 @@ function RotatingEncryptedText({
       {display}
     </h1>
   );
+}
+
+async function captureResultImage(element: HTMLElement) {
+  const { default: html2canvas } = await import("html2canvas");
+  if (document.fonts?.ready) {
+    await document.fonts.ready;
+  }
+
+  const canvas = await html2canvas(element, {
+    backgroundColor: "#eceef1",
+    useCORS: true,
+    scale: Math.min(2, window.devicePixelRatio || 1.5),
+    logging: false,
+  });
+
+  return await new Promise<Blob | null>((resolve) => {
+    canvas.toBlob(resolve, "image/png");
+  });
 }
 
 function shouldKeepChar(char: string) {
