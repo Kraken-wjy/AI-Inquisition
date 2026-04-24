@@ -108,11 +108,7 @@ function mapAuditRequestError(error: unknown): string {
 }
 
 function isOfflineReview(review: ModelReview) {
-  return (
-    review.verdict === "uncertain" &&
-    review.oneLiner.includes("暂时离线") &&
-    review.longComment.includes("当前通道繁忙")
-  );
+  return review.oneLiner.includes("暂时离线");
 }
 
 async function requestAudit(
@@ -253,6 +249,7 @@ export default function Home() {
   const [showDebugControls, setShowDebugControls] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [isRetryingFailed, setIsRetryingFailed] = useState(false);
+  const [retryingCardIds, setRetryingCardIds] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [submittedText, setSubmittedText] = useState("");
   const [reviews, setReviews] = useState<ModelReview[] | null>(null);
@@ -399,21 +396,23 @@ export default function Home() {
     }
   }
 
-  async function retryFailedCards() {
+  async function retrySpecificCards(targetIds: string[]) {
     if (!reviews || isLoading || isRetryingFailed) {
       return;
     }
 
-    const failedIds = reviews.filter(isOfflineReview).map((review) => review.id);
-    if (failedIds.length === 0) {
+    const knownIds = new Set(reviews.map((review) => review.id));
+    const retryIds = Array.from(new Set(targetIds.filter((id) => knownIds.has(id))));
+    if (retryIds.length === 0) {
       return;
     }
 
     setError(null);
     setIsRetryingFailed(true);
+    setRetryingCardIds((prev) => Array.from(new Set([...prev, ...retryIds])));
     try {
       const payload = await requestAudit(submittedText, styleMode, {
-        retryCardIds: failedIds,
+        retryCardIds: retryIds,
         forceRefresh: true,
       });
       setReviews(payload.reviews);
@@ -421,8 +420,17 @@ export default function Home() {
     } catch (retryError) {
       setError(mapAuditRequestError(retryError));
     } finally {
+      setRetryingCardIds((prev) => prev.filter((id) => !retryIds.includes(id)));
       setIsRetryingFailed(false);
     }
+  }
+
+  async function retryFailedCards() {
+    if (!reviews) {
+      return;
+    }
+    const failedIds = reviews.filter(isOfflineReview).map((review) => review.id);
+    await retrySpecificCards(failedIds);
   }
 
   const displayError =
@@ -449,6 +457,7 @@ export default function Home() {
           meta={meta}
           failedCount={reviews.filter(isOfflineReview).length}
           retryingFailed={isRetryingFailed}
+          retryingCardIds={retryingCardIds}
           onRetry={() => {
             setReviews(null);
             setError(null);
@@ -457,6 +466,9 @@ export default function Home() {
           }}
           onRetryFailed={() => {
             void retryFailedCards();
+          }}
+          onRetryCard={(reviewId) => {
+            void retrySpecificCards([reviewId]);
           }}
         />
       ) : (
@@ -637,16 +649,20 @@ function ResultScene({
   meta,
   failedCount,
   retryingFailed,
+  retryingCardIds,
   onRetry,
   onRetryFailed,
+  onRetryCard,
 }: {
   submittedText: string;
   reviews: ModelReview[];
   meta: CostControlMeta | null;
   failedCount: number;
   retryingFailed: boolean;
+  retryingCardIds: string[];
   onRetry: () => void;
   onRetryFailed: () => void;
+  onRetryCard: (reviewId: string) => void;
 }) {
   const [shareStatus, setShareStatus] = useState<ShareStatus>("idle");
   const resultRef = useRef<HTMLDivElement | null>(null);
@@ -663,29 +679,33 @@ function ResultScene({
         : null;
 
     try {
-      const imageBlob = resultRef.current ? await captureResultImage(resultRef.current) : null;
-      if (imageBlob) {
-        const imageFile = new File([imageBlob], `ai-inquisition-${Date.now()}.png`, { type: "image/png" });
-        if (nav?.share && nav.canShare?.({ files: [imageFile] })) {
-          await nav.share({
-            title: "AI 审判庭结果",
-            text: "AI 生成，仅供参考",
-            files: [imageFile],
-          });
-          setShareStatus("shared");
-          return;
-        }
+      try {
+        const imageBlob = resultRef.current ? await captureResultImage(resultRef.current) : null;
+        if (imageBlob) {
+          const imageFile = new File([imageBlob], `ai-inquisition-${Date.now()}.png`, { type: "image/png" });
+          if (nav?.share && nav.canShare?.({ files: [imageFile] })) {
+            await nav.share({
+              title: "AI 审判庭结果",
+              text: "AI 生成，仅供参考",
+              files: [imageFile],
+            });
+            setShareStatus("shared");
+            return;
+          }
 
-        if (
-          nav?.clipboard &&
-          typeof nav.clipboard.write === "function" &&
-          typeof window !== "undefined" &&
-          "ClipboardItem" in window
-        ) {
-          await nav.clipboard.write([new ClipboardItem({ "image/png": imageBlob })]);
-          setShareStatus("copied");
-          return;
+          if (
+            nav?.clipboard &&
+            typeof nav.clipboard.write === "function" &&
+            typeof window !== "undefined" &&
+            "ClipboardItem" in window
+          ) {
+            await nav.clipboard.write([new ClipboardItem({ "image/png": imageBlob })]);
+            setShareStatus("copied");
+            return;
+          }
         }
+      } catch {
+        // 截图失败时继续走文本分享兜底，避免直接报失败。
       }
 
       if (nav?.share) {
@@ -760,6 +780,16 @@ function ResultScene({
                 <p className="mt-2 line-clamp-9 text-[13px] leading-5 text-black/62 break-words [overflow-wrap:anywhere] md:line-clamp-10">
                   {review.longComment}
                 </p>
+                {isOfflineReview(review) ? (
+                  <button
+                    type="button"
+                    onClick={() => onRetryCard(review.id)}
+                    disabled={retryingFailed || retryingCardIds.includes(review.id)}
+                    className="mt-auto self-start rounded-md border border-black/15 bg-white/75 px-2.5 py-1 text-[10px] uppercase tracking-[0.12em] text-black/65 transition hover:border-black/30 disabled:cursor-not-allowed disabled:opacity-55"
+                  >
+                    {retryingCardIds.includes(review.id) ? "重试中…" : "重试此卡"}
+                  </button>
+                ) : null}
               </article>
             </div>
           ))}
